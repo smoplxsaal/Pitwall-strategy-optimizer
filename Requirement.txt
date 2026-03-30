@@ -1,4 +1,4 @@
 fastf1
 numpy
 pandas
-matplotlib
+
