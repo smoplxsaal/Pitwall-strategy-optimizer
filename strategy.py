@@ -1,71 +1,161 @@
-def clean_data(laps, driver):
-    raw_driver_data = laps[laps['Driver'] == driver].copy()
-    raw_driver_data['LapTimeSeconds'] = raw_driver_data['LapTime'].dt.total_seconds()
-    driver_data = raw_driver_data[
-        raw_driver_data['PitInTime'].isna() &
-        raw_driver_data['PitOutTime'].isna()
-    ].copy()
-    driver_data = driver_data.pick_quicklaps().pick_accurate()
-    Fuel = driver_data[driver_data['Compound'] == 'HARD']
-    if len(Fuel) < 5:
-        return {"error": "Not enough HARD data for fuel estimation"}
-    Fuel_burn, _ = np.polyfit(Fuel['TyreLife'], Fuel['LapTimeSeconds'], 1)
-    deg_results = {}
-    compounds = driver_data['Compound'].unique()
-    for comp in compounds:
-        comp_data = driver_data[driver_data['Compound'] == comp]
+def cleaned_data(laps,driver):
+    raw_driver_data=laps[laps['Driver']==driver]
+    # Check if driver even exists in data
+    if raw_driver_data.empty:
+        return "driver data not enough"
+        
+    raw_driver_data['LapTime in sec']=raw_driver_data['LapTime'].dt.total_seconds()
+    driver_data=raw_driver_data.copy()
+    driver_data=driver_data[driver_data['LapNumber']>=2].reset_index()
+    driver_data=driver_data[driver_data['PitInTime'].isna() & driver_data['PitOutTime'].isna()]
+    
+    if driver_data.empty:
+        return "driver data not enough"
+
+    total_lap=raw_driver_data['LapNumber'].max()
+    starting_fuel=110
+    fuel_burn=starting_fuel/total_lap
+    fuel_burn=fuel_burn*0.05
+    driver_data['LapTime in sec']=driver_data['LapTime'].dt.total_seconds()
+    driver_data['Fuel Corrected Time'] = driver_data['LapTime in sec'] - ((starting_fuel - (driver_data['LapNumber'] * fuel_burn)) * 0.05)
+    driver_data['Cummulative']=driver_data['Fuel Corrected Time'].diff()
+    average_fuel_burn=driver_data['Cummulative'].mean()
+    driver_data['True Fuel Pace']=driver_data['LapTime in sec']+((starting_fuel - (driver_data['LapNumber'] * fuel_burn)) * average_fuel_burn)
+    cleaned_data=driver_data[['Driver','LapNumber','LapTime in sec','Stint','TyreLife','Compound','Fuel Corrected Time','True Fuel Pace']]
+    
+    deg_result={}
+    compound=cleaned_data['Compound'].unique()
+    
+    # Requirement: Must have more than one compound to run a strategy
+    if len(compound) < 2:
+        return "driver data not enough"
+
+    for comp in compound:
+        comp_data=cleaned_data[cleaned_data['Compound']==comp]
         if len(comp_data) < 5:
-            continue
-        slope, _ = np.polyfit(comp_data['TyreLife'],
-                              comp_data['LapTimeSeconds'], 1)
-        deg_results[comp] = slope - Fuel_burn
-    formatted_deg = {comp: f"{val:.3f}" for comp, val in deg_results.items()}
-    if raw_driver_data['PitInTime'].notna().sum() == 0:
-        return {"error": "No pit stop found"}
-    pit_lap = raw_driver_data[raw_driver_data['PitInTime'].notna()].index[0]
-    old_lap = raw_driver_data.loc[pit_lap - 1, 'LapTimeSeconds']
-    new_lap = raw_driver_data.loc[pit_lap + 2, 'LapTimeSeconds']
-    Fresh_Tyre_delta = old_lap - new_lap
-    inlap = raw_driver_data.loc[pit_lap, 'LapTimeSeconds']
-    InLap_penalty = inlap - old_lap
-    return {
-        "fuel_burn": Fuel_burn,
-        "degradation": deg_results,
-        "fresh_delta": Fresh_Tyre_delta,
-        "inlap_penalty": InLap_penalty
+            deg_result[comp]={
+                'Degradation':"Not enough data",
+                'Average Pace':"Not enough data"
             }
+        else:
+            deg,base_pace=np.polyfit(comp_data['TyreLife'],comp_data['True Fuel Pace'],1)
+            deg_result[comp]={
+                'Degradation':float(deg),
+                'Average Pace':float(base_pace)
+            }
+            
+    new_tyre={}
+    for comp in compound:
+        comp_data=cleaned_data[cleaned_data['Compound']==comp].reset_index()
+        if len(comp_data) > 2:
+            new_lap=comp_data.loc[1,'True Fuel Pace']
+            next_lap=comp_data.loc[2,'True Fuel Pace']
+            new_tyre_adv=f"{next_lap-new_lap}"
+            new_tyre[comp]=new_tyre_adv
+            
+    strategy={}
 
-def predict_gap(driver_a, driver_b, L, N):
-    lap_A = laps[laps['Driver'] == driver_a].copy()
-    lap_B = laps[laps['Driver'] == driver_b].copy()
-    lap_A['LapTimeSec'] = lap_A['LapTime'].dt.total_seconds()
-    lap_B['LapTimeSec'] = lap_B['LapTime'].dt.total_seconds()
-    delta_A = lap_A[lap_A['LapNumber'] <= L]['LapTimeSec'].sum()
-    delta_B = lap_B[lap_B['LapNumber'] <= L]['LapTimeSec'].sum()
-    gap = delta_B - delta_A
-    lap_time_A = lap_A[lap_A['LapNumber'] == L]['LapTimeSec'].values[0]
-    lap_time_B = lap_B[lap_B['LapNumber'] == L]['LapTimeSec'].values[0]
-    fuel_A = profile_A["fuel_burn"]
-    fuel_B = profile_B["fuel_burn"]
-    deg_A = list(profile_A["degradation"].values())[0]
-    deg_B = list(profile_B["degradation"].values())[0]
-    possible_gaps = []
-    for i in range(N):
-        lap_time_A = lap_time_A - fuel_A + deg_A
-        lap_time_B = lap_time_B - fuel_B + deg_B
-        gap = gap + (lap_time_B - lap_time_A)
-        possible_gaps.append(gap)
-    return possible_gaps
+    if 'MEDIUM' in compound and 'HARD' in compound and 'SOFT' not in compound:
+        medium_mh=int(total_lap*(40/100))
+        hard_mh=int(total_lap-medium_mh)
+        fb=fuel_burn
+        totaltime_mh=0
+        time_mh=[]
+        med_p=float(deg_result['MEDIUM']['Average Pace'])
+        med_d=float(deg_result['MEDIUM']['Degradation'])
+        hard_d=float(deg_result['HARD']['Degradation'])
+        hard_p=float(deg_result['HARD']['Average Pace'])
+        for i in range(1,medium_mh+1):
+            laptime=med_p+(med_d*i)-(fb*i)
+            time_mh.append([i,float(round(laptime,3))])
+            totaltime_mh+=laptime
+        totaltime_mh+=22
+        time_mh[-1][1]+=20
 
+        for i in range(1,hard_mh+1):
+            race_lap=medium_mh+i
+            laptime=hard_p+(hard_d*i)-(fb*race_lap)
+            totaltime_mh+=laptime
+            time_mh.append([race_lap,float(round(laptime,3))])
+        strategy['M-H']=f"{totaltime_mh:.3f}"
 
-def best_pit(start_lap, end_lap, predict_till):
-    result = {}
-    for pit_lap in range(start_lap, end_lap + 1):
-        N = predict_till - pit_lap
-        gap_built = predict_gap(driver_a, driver_b, pit_lap, N)
-        final_gap = gap_built[-1]
-        result[pit_lap] = round(float(final_gap), 1)
-    best_lap = min(result, key=result.get)
-    print(f"Best lap: {best_lap}")
-    print(f"Expected Gain: {abs(result[best_lap]):.3f}")
-    return result
+        hard_hm=int(total_lap*(60/100))
+        medium_hm=int(total_lap-hard_hm)
+        totaltime_hm=0
+        time_hm=[]
+        for i in range(1,hard_hm+1):
+            laptime=hard_p+(hard_d*i)-(fuel_burn*i)
+            time_hm.append([i,float(round(laptime,3))])
+            totaltime_hm+=laptime
+        totaltime_hm+=20
+        time_hm[-1][1]+=20
+        for i in range(1,medium_hm+1):
+                race_lap=hard_hm+i
+                laptime=med_p+(med_d*i)-(fuel_burn*race_lap)
+                time_hm.append([race_lap,float(round(laptime,3))])
+                totaltime_hm+=laptime
+        strategy['H-M']=f"{totaltime_hm:.3f}"
+
+    if ('SOFT' in compound) and ('HARD' in compound or 'MEDIUM' in compound):
+                soft_sms = int(total_lap * 0.25)
+                medium_sms = int(total_lap * 0.50)
+                soft2_sms = int(total_lap - (soft_sms + medium_sms))
+                total_time_sms = 0
+                time_sms = []
+                
+                # Check for enough data before pulling floats
+                if deg_result.get('MEDIUM', {}).get('Average Pace') == "Not enough data" or \
+                   deg_result.get('SOFT', {}).get('Average Pace') == "Not enough data":
+                    strategy['S-M-S'] = "Not enough data"
+                else:
+                    med_p=float(deg_result['MEDIUM']['Average Pace'])
+                    med_d=float(deg_result['MEDIUM']['Degradation'])
+                    soft_p=float(deg_result['SOFT']['Average Pace'])
+                    soft_d=float(deg_result['SOFT']['Degradation'])
+                    
+                    for i in range(1, soft_sms + 1):
+                        laptime = soft_p + (soft_d * i) - (fuel_burn * i)
+                        total_time_sms += laptime
+                    total_time_sms += 22
+                    for i in range(1, medium_sms + 1):
+                        race_lap = soft_sms + i
+                        laptime = med_p + (med_d * i) - (fuel_burn * race_lap)
+                        total_time_sms += laptime
+                    total_time_sms += 22
+                    for i in range(1, soft2_sms + 1):
+                        race_lap = soft_sms + medium_sms + i
+                        laptime = soft_p + (soft_d * i) - (fuel_burn * race_lap)
+                        total_time_sms += laptime
+                    strategy['S-M-S'] = f"{total_time_sms:.3f}"
+
+                # S-M-H Strategy
+                if 'HARD' in deg_result and deg_result['HARD']['Average Pace'] != "Not enough data":
+                    soft_smh = int(total_lap * 0.20)
+                    med_smh = int(total_lap * 0.30)
+                    hard_smh = int(total_lap - (soft_smh + med_smh))
+                    total_time_smh = 0
+                    hard_p=float(deg_result['HARD']['Average Pace'])
+                    hard_d=float(deg_result['HARD']['Degradation'])
+
+                    for i in range(1, soft_smh + 1):
+                        laptime = soft_p + (soft_d * i) - (fuel_burn * i)
+                        total_time_smh += laptime
+                    total_time_smh += 22
+                    for i in range(1, med_smh + 1):
+                        race_lap = soft_smh + i
+                        laptime = med_p + (med_d * i) - (fuel_burn * race_lap)
+                        total_time_smh += laptime
+                    total_time_smh += 22
+                    for i in range(1, hard_smh + 1):
+                        race_lap = soft_smh + med_smh + i
+                        laptime = hard_p + (hard_d * i) - (fuel_burn * race_lap)
+                        total_time_smh += laptime
+                    strategy['S-M-H'] = f"{total_time_smh:.3f}"
+                    
+    return {
+        'Fuel Burn':f"{average_fuel_burn:.3f}",
+        'Degradation':deg_result,
+        'Average PitStop Time':22,
+        'New Tyre Advantage':new_tyre,
+        'Strategy':strategy
+    }
